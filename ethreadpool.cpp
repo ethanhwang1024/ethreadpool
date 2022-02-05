@@ -1,7 +1,5 @@
 #include "ethreadpool.h"
 #include <functional>
-#include <utility>
-#include <iostream>
 #include <thread>
 
 
@@ -30,35 +28,6 @@ void ThreadPool::setTaskQMaxThreshold(int threshold) {
     _taskQMaxThreshold = threshold;
 }
 
-Result ThreadPool::submitTask(const std::shared_ptr<Task>& sp) {
-
-    std::unique_lock<std::mutex> lock(_taskQMtx);
-    if(!_notFull.wait_for(lock,std::chrono::seconds(1),
-                          [&]()->bool {return _taskQ.size()<_taskQMaxThreshold;})){
-        printf("task queue is full,submit task fail.");
-        return Result(sp, false);
-    }
-    _taskQ.emplace(sp);
-    _taskSize++;
-    _cv.notify_all();
-    if(_poolMode == PoolMode::MODE_CACHED && _taskSize > _idleThreadSize){
-        //add thread
-        for(int i=0;i<_taskSize-_idleThreadSize;i++){
-            if(_currentThreadSize>=_maxThreadSize){
-                break;
-            }
-            auto ptr = std::make_shared<Thread>([this](int threadId){ threadFunc(threadId); });
-            int threadId = ptr->getId();
-            _threads.emplace(ptr->getId(),std::move(ptr));
-            _threads[threadId]->start();
-            _idleThreadSize ++;
-            _currentThreadSize ++;
-        }
-    }
-    return Result(sp, true);
-}
-
-
 void ThreadPool::start() {
     _isRunning = true;
     //create thread object
@@ -77,7 +46,7 @@ void ThreadPool::start() {
 void ThreadPool::threadFunc(int threadId)  {
     auto lastTime = std::chrono::high_resolution_clock::now();
    for(;;){
-       std::shared_ptr<Task> task;
+       std::function<void()> task;
        {
            std::unique_lock<std::mutex> lock(_threadFuxMtx);
            while (_taskQ.empty()){
@@ -114,17 +83,13 @@ void ThreadPool::threadFunc(int threadId)  {
            _notFull.notify_all();
        }
        if(task!= nullptr){
-           Any any = task->run();
-           task->get()->setVal(std::move(any));
+            task();
        }
        _idleThreadSize ++;
        lastTime = std::chrono::high_resolution_clock::now();
    }
 }
 
-bool ThreadPool::checkRunning() const {
-    return _isRunning;
-}
 
 ThreadPool::~ThreadPool() {
     _isRunning = false;
@@ -151,24 +116,4 @@ int Thread::getId() const {
     return _threadId;
 }
 
-//--------------------> for Result <-----------------
-Result::Result(std::shared_ptr<Task> task, bool isValid)
-:_task(std::move(task)),_isValid(isValid)
-{
-    _task->set(this);
-}
-
-Any Result::get() {
-    if(!_isValid){
-        return "";
-    }
-    _sem.wait();
-    return std::move(_any);
-}
-
-void Result::setVal(Any any)
-{
-    this->_any = std::move(any);
-    _sem.post();
-}
 

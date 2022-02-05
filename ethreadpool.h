@@ -10,104 +10,12 @@
 #include <functional>
 #include <thread>
 #include <unordered_map>
+#include <future>
+
 
 #define TASK_MAX 4096
 #define INVALID_THREAD_SIZE 0
 const unsigned int INIT_THREAD_SIZE = std::thread::hardware_concurrency();
-
-class Semaphore{
-public:
-    Semaphore(int limit=0)
-        :_resLimit(limit)
-    {}
-    ~Semaphore() = default;
-    //acquire a semaphore resource
-    void wait(){
-        std::unique_lock<std::mutex> lock(_mtx);
-        if(--_resLimit<0){
-            _cond.wait(lock,[&]()->bool {return _resLimit>0;});
-        }
-    }
-    //add a semaphore resource
-    void post(){
-        std::unique_lock<std::mutex> lock(_mtx);
-        if (++_resLimit < 1) {
-            _cond.notify_one();
-        }
-    }
-private:
-    int _resLimit;
-    std::mutex _mtx;
-    std::condition_variable _cond;
-};
-
-
-class Any{
-public:
-    //just show you the default status
-    Any() = default;
-    ~Any() = default;
-    Any(const Any&) = delete;
-    Any& operator=(const Any&) = delete;
-    Any(Any&&) = default;
-    Any& operator=(Any&&) = default;
-
-    template<typename T>
-    Any(T data):_base(std::make_unique<Derive<T>>(data)){};
-
-    template<typename T>
-    T getData(){
-        auto *pd = dynamic_cast<Derive<T>*>(_base.get());
-        return pd->getData();
-    }
-private:
-    class Base{
-    public:
-        virtual ~Base() = default;
-    };
-    template<typename T>
-    class Derive:public Base{
-    public:
-        Derive(T data):_data(data){}
-        T getData(){
-            return _data;
-        }
-    private:
-        T _data;
-    };
-private:
-    std::unique_ptr<Base> _base;
-};
-
-class Result;
-class Task{
-public:
-    Task() = default;
-    ~Task() = default;
-    virtual Any run() = 0;
-    void set(Result *result){
-        _result = result;
-    }
-    Result* get(){
-        return _result;
-    }
-private:
-    Result* _result= nullptr;
-};
-
-class Result{
-public:
-    explicit Result(std::shared_ptr<Task> task,bool isValid=true);
-    ~Result() = default;
-    void setVal(Any any);
-    Any get();
-private:
-    Any _any;
-    Semaphore _sem;
-    std::shared_ptr<Task> _task;
-    std::atomic_bool _isValid;
-};
-
 
 enum class PoolMode{
     MODE_FIXED,
@@ -135,11 +43,48 @@ public:
             unsigned int maxThreadSize = INVALID_THREAD_SIZE ,unsigned int taskMax = TASK_MAX);
     ~ThreadPool();
     void setTaskQMaxThreshold(int threshold);
-    Result submitTask(const std::shared_ptr<Task>& sp);
+
+    template<typename Func, typename... Args>
+    auto submitTask(Func&& func, Args&&... args) -> std::future<decltype(func(args...))>{
+        using RType = decltype(func(args...));
+        auto task = std::make_shared<std::packaged_task<RType()>>(
+                std::bind(std::forward<Func>(func), std::forward<Args>(args)...));
+
+        std::future<RType> result = task->get_future();
+
+        std::unique_lock<std::mutex> lock(_taskQMtx);
+        if(!_notFull.wait_for(lock,std::chrono::seconds(1),
+                              [&]()->bool {return _taskQ.size()<_taskQMaxThreshold;})){
+            printf("task queue is full,submit task fail.");
+            auto tmpTask = std::make_shared<std::packaged_task<RType()>>
+                    ([]()-> RType {return RType();});
+            (*tmpTask)();
+            return tmpTask->get_future();
+        }
+        std::function<void()> fuc = [=](){(*task)();};
+        _taskQ.emplace(fuc);
+        _taskSize++;
+        _cv.notify_all();
+        if(_poolMode == PoolMode::MODE_CACHED && _taskSize > _idleThreadSize){
+            //add thread
+            for(int i=0;i<_taskSize-_idleThreadSize;i++){
+                if(_currentThreadSize>=_maxThreadSize){
+                    break;
+                }
+                auto ptr = std::make_shared<Thread>([this](int threadId){ threadFunc(threadId); });
+                int threadId = ptr->getId();
+                _threads.emplace(ptr->getId(),std::move(ptr));
+                _threads[threadId]->start();
+                _idleThreadSize ++;
+                _currentThreadSize ++;
+            }
+        }
+        return result;
+    }
+
     void start();
     ThreadPool(const ThreadPool&) = delete;
     ThreadPool& operator=(const ThreadPool&) = delete;
-    bool checkRunning() const;
     unsigned int getCurrentThreadSize()const{
         return _currentThreadSize;
     };
@@ -148,7 +93,8 @@ private:
 private:
     std::unordered_map<int,std::shared_ptr<Thread>> _threads;
     unsigned int _initThreadSize;
-    std::queue<std::shared_ptr<Task>> _taskQ;
+    using Task = std::function<void()>;
+    std::queue<Task> _taskQ;
     std::atomic_uint _taskSize;
     unsigned int _taskQMaxThreshold;
     std::mutex _taskQMtx;
