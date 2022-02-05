@@ -1,5 +1,6 @@
 # ethreadpool
-c++ thread pool
+c++ thread pool  
+c++ 线程池实现，使用可变参+packaged_task，使得任务提交更加简单
 
 ## Fixed mode
 ```c++
